@@ -1,26 +1,24 @@
 name: a1-hunter
 
 # Oracle A1.Flex(무료 4코어/24GB) capacity 가 날 때까지 24/7 자동 시도.
-#   Cloud Shell 은 세션이 끊겨 지속 시도가 안 됨 → GitHub Actions 로 상시 시도.
-#   이미 chalkak-relay-a1 인스턴스가 있으면 건너뜀(중복 생성·과금 방지).
-#   잡히면 텔레그램으로 알림.
-#   Secrets: OCI_CLI_USER, OCI_CLI_TENANCY, OCI_CLI_FINGERPRINT, OCI_CLI_KEY_CONTENT,
-#            OCI_CLI_REGION (기존) + A1_SUBNET, A1_SSH_PUBKEY,
-#            TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+#   한 번 실행이 내부에서 ~12분간 45초마다 빡빡하게 재시도(끊김 없는 루프) →
+#   15분마다 재실행으로 사실상 24/7 연속. Cloud Shell 과 달리 세션이 안 죽음.
+#   이미 chalkak-relay-a1 인스턴스가 있으면 건너뜀(중복 생성·과금 방지). 잡히면 텔레그램 알림.
+#   Secrets: OCI_CLI_* (기존) + A1_SUBNET, A1_SSH_PUBKEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 
 on:
   schedule:
-    - cron: "*/20 * * * *"
+    - cron: "*/15 * * * *"
   workflow_dispatch: {}
 
 concurrency:
   group: a1-hunter
-  cancel-in-progress: false
+  cancel-in-progress: false # 실행 중이면 새 트리거는 대기(중복 시도 방지)
 
 jobs:
   hunt:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 14
     env:
       OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
       OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
@@ -35,9 +33,8 @@ jobs:
       - name: Install OCI CLI
         run: pip install --quiet oci-cli
 
-      - name: Hunt A1 capacity (all ADs)
+      - name: Hunt A1 capacity (tight loop ~12min)
         run: |
-          set -e
           NAME="chalkak-relay-a1"
           notify() { [ -n "$TG_TOKEN" ] && curl -s "https://api.telegram.org/bot$TG_TOKEN/sendMessage" \
             -d chat_id="$TG_CHAT" -d text="$1" >/dev/null || true; }
@@ -45,39 +42,38 @@ jobs:
           # 0) 이미 있으면 종료 (중복 생성·과금 방지).
           EXIST=$(oci compute instance list --compartment-id "$T" \
             --display-name "$NAME" --query "data[?\"lifecycle-state\"!='TERMINATED'] | length(@)" --raw-output 2>/dev/null || echo 0)
-          if [ "${EXIST:-0}" != "0" ]; then
-            echo "이미 $NAME 존재 ($EXIST) — 시도 안 함"; exit 0
-          fi
+          if [ "${EXIST:-0}" != "0" ]; then echo "이미 $NAME 존재 — 종료"; exit 0; fi
 
-          # 1) Ubuntu 22.04 (aarch64) 이미지.
           IMAGE=$(oci compute image list --compartment-id "$T" \
             --operating-system "Canonical Ubuntu" --operating-system-version "22.04" \
             --shape "VM.Standard.A1.Flex" --sort-by TIMECREATED --sort-order DESC \
             --query 'data[0].id' --raw-output)
-
-          # 2) 모든 AD 순회하며 시도.
           ADS=$(oci iam availability-domain list --query 'data[].name' --raw-output | tr -d '[]"," ')
           echo "${{ secrets.A1_SSH_PUBKEY }}" > /tmp/a1.pub
 
-          for AD in $ADS; do
-            echo "[$AD] launch 시도..."
-            if oci compute instance launch \
-              --availability-domain "$AD" --compartment-id "$T" \
-              --shape "VM.Standard.A1.Flex" --shape-config '{"ocpus":1,"memoryInGBs":6}' \
-              --image-id "$IMAGE" --subnet-id "$SUBNET" --assign-public-ip true \
-              --display-name "$NAME" --ssh-authorized-keys-file /tmp/a1.pub \
-              > /tmp/launch.json 2>/tmp/launch.err; then
-              IP=$(oci compute instance list-vnics --instance-id "$(grep -o '"id": "[^"]*"' /tmp/launch.json | head -1 | cut -d'"' -f4)" --query 'data[0]."public-ip"' --raw-output 2>/dev/null || echo "")
-              echo "✅ 생성 성공! ($AD) IP=$IP"
-              notify "✅ chalkak A1 인스턴스 생성 성공! ($AD) public IP: ${IP:-콘솔확인} — 릴레이 이전 시작하세요"
-              exit 0
-            fi
-            if grep -iqE "capacity|TooManyRequests|429|throttl|RateLimit|host capacity" /tmp/launch.err; then
-              echo "  용량/throttle — 다음 AD/회차"; sleep 5
-            else
-              echo "  다른 에러:"; cat /tmp/launch.err
-              notify "⚠️ a1-hunter 비정상 에러 — Actions 로그 확인"
-              exit 1
-            fi
+          DEADLINE=$(( $(date +%s) + 12*60 ))   # 이 실행에서 ~12분간 반복
+          ATTEMPT=0
+          while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+            ATTEMPT=$((ATTEMPT+1))
+            for AD in $ADS; do
+              echo "[$ATTEMPT][$AD] launch..."
+              if oci compute instance launch \
+                --availability-domain "$AD" --compartment-id "$T" \
+                --shape "VM.Standard.A1.Flex" --shape-config '{"ocpus":1,"memoryInGBs":6}' \
+                --image-id "$IMAGE" --subnet-id "$SUBNET" --assign-public-ip true \
+                --display-name "$NAME" --ssh-authorized-keys-file /tmp/a1.pub \
+                > /tmp/launch.json 2>/tmp/launch.err; then
+                echo "✅ 생성 성공! ($AD)"
+                notify "✅ chalkak A1 인스턴스 생성 성공! ($AD) — 콘솔에서 public IP 확인 후 릴레이 이전 시작하세요"
+                exit 0
+              fi
+              if ! grep -iqE "capacity|TooManyRequests|429|throttl|RateLimit|host capacity" /tmp/launch.err; then
+                echo "  다른 에러:"; cat /tmp/launch.err
+                notify "⚠️ a1-hunter 비정상 에러 — Actions 로그 확인"
+                exit 1
+              fi
+              echo "  용량없음/throttle"
+            done
+            sleep 45
           done
-          echo "이번 회차 capacity 없음 — 다음 스케줄 재시도"
+          echo "이번 회차(${ATTEMPT}회 시도) capacity 없음 — 다음 스케줄 재시도"
