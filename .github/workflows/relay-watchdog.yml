@@ -1,0 +1,57 @@
+name: relay-watchdog
+
+# 키움 릴레이(Oracle VM) 외부 헬스 감시 → 죽으면 OCI 로 강제 재부팅(RESET).
+#   VM 안의 watchdog/mem-guard 는 "박스째 얼면" 같이 멈춰 못 살림 → 외부에서 강제.
+#   RESET = 하드 power-cycle(언 박스도 무조건 재부팅). SOFTRESET(ACPI)은 언 박스가 무시함.
+#   필요한 Secrets: RELAY_HEALTH_URL, OCI_INSTANCE_OCID,
+#     OCI_CLI_USER, OCI_CLI_TENANCY, OCI_CLI_FINGERPRINT, OCI_CLI_KEY_CONTENT, OCI_CLI_REGION
+#   ※ 이 파일은 watchdog 전용 PUBLIC 레포에 둔다 (Actions 분 무제한). chalkak 레포 아님.
+
+on:
+  schedule:
+    - cron: "*/10 * * * *" # 10분마다 (UTC). public 레포라 분 걱정 없음.
+  workflow_dispatch: {} # 수동 실행 버튼
+
+concurrency:
+  group: relay-watchdog
+  cancel-in-progress: false
+
+jobs:
+  watchdog:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Health check (5 tries over ~4 min)
+        id: check
+        run: |
+          URL="${{ secrets.RELAY_HEALTH_URL }}"
+          if [ -z "$URL" ]; then echo "RELAY_HEALTH_URL 미설정"; exit 1; fi
+          alive=0
+          for i in 1 2 3 4 5; do
+            if curl -fsS --max-time 8 "$URL" >/dev/null 2>&1; then
+              echo "try $i: ok"; alive=1; break
+            fi
+            echo "try $i: down"
+            [ "$i" -lt 5 ] && sleep 50
+          done
+          echo "alive=$alive" >> "$GITHUB_OUTPUT"
+
+      - name: Install OCI CLI
+        if: steps.check.outputs.alive == '0'
+        run: pip install --quiet oci-cli
+
+      - name: Force RESET frozen instance
+        if: steps.check.outputs.alive == '0'
+        env:
+          OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
+          OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
+          OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
+          OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
+          OCI_CLI_REGION: ${{ secrets.OCI_CLI_REGION }}
+        run: |
+          echo "릴레이 4분간 무응답 → RESET(강제 재부팅) 실행"
+          oci compute instance action \
+            --instance-id "${{ secrets.OCI_INSTANCE_OCID }}" \
+            --action RESET \
+            --wait-for-state RUNNING --max-wait-seconds 300
+          echo "RESET 완료 — 부팅 후 pm2 가 릴레이 자동 복원"
