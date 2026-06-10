@@ -62,6 +62,7 @@ jobs:
                 --shape "VM.Standard.A1.Flex" --shape-config '{"ocpus":1,"memoryInGBs":6}' \
                 --image-id "$IMAGE" --subnet-id "$SUBNET" --assign-public-ip true \
                 --display-name "$NAME" --ssh-authorized-keys-file /tmp/a1.pub \
+                --connection-timeout 60 --read-timeout 120 \
                 > /tmp/launch.json 2>/tmp/launch.err; then
                 echo "✅ 생성 성공! ($AD)"
                 notify "✅ chalkak A1 인스턴스 생성 성공! ($AD) — 콘솔에서 public IP 확인 후 릴레이 이전 시작"
