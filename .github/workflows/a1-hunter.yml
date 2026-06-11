@@ -2,7 +2,7 @@ name: a1-hunter
 # Oracle A1.Flex(무료 4코어/24GB) capacity 가 날 때까지 24/7 자동 시도.
 #   한 번 실행이 내부에서 ~18분간 60초마다 재시도 → 15분마다 재실행으로 사실상 연속.
 #   이미 chalkak-relay-a1 인스턴스가 있으면 건너뜀(중복 생성·과금 방지).
-#   ★ 알림은 "성공" + "설정 에러" 때만 텔레그램. capacity 실패는 로그에만(스팸 방지).
+#   ★ 알림은 "성공" 때만 텔레그램. 실패(capacity/연결오류/throttle 등)는 전부 로그에만(스팸 방지).
 #   Secrets: OCI_CLI_* (기존) + A1_SUBNET, A1_SSH_PUBKEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 on:
   schedule:
@@ -43,12 +43,11 @@ jobs:
           IMAGE=$(oci compute image list --compartment-id "$T" \
             --operating-system "Canonical Ubuntu" --operating-system-version "22.04" \
             --shape "VM.Standard.A1.Flex" --sort-by TIMECREATED --sort-order DESC \
-            --query 'data[0].id' --raw-output)
+            --query 'data[0].id' --raw-output 2>/dev/null || echo "")
           echo "IMAGE=$IMAGE"
           if [ -z "$IMAGE" ] || [ "$IMAGE" = "null" ]; then
-            echo "❌ 이미지 조회 실패 — 쿼리/권한 확인 필요 (capacity 아님)"
-            notify "❌ a1-hunter: 이미지 조회 실패 — 설정 점검 필요"
-            exit 1
+            echo "⚠ 이미지 조회 실패(일시적 연결 오류 가능) — 이번 회차 건너뜀, 다음 실행에서 재시도"
+            exit 0
           fi
 
           ADS=$(oci iam availability-domain list --query 'data[].name' --raw-output | tr -d '[]"," ')
@@ -57,7 +56,6 @@ jobs:
 
           DEADLINE=$(( $(date +%s) + 18*60 ))
           ATTEMPT=0
-          CONFIG_ERR=0
           while [ "$(date +%s)" -lt "$DEADLINE" ]; do
             ATTEMPT=$((ATTEMPT+1))
             for AD in $ADS; do
@@ -72,24 +70,14 @@ jobs:
                 notify "✅ chalkak A1 인스턴스 생성 성공! ($AD) — 콘솔에서 public IP 확인 후 릴레이 이전 시작"
                 exit 0
               fi
-
+              # 실패는 종류 불문 로그에만 (capacity / 연결오류 / 429 등) — 알림 안 함
               ERR=$(head -c 600 /tmp/launch.err)
               echo "[$ATTEMPT][$AD] 실패: $ERR"
-
-              if echo "$ERR" | grep -qi "out of host capacity\|InternalError"; then
-                : # 정상 — 물량 대기 (오라클은 capacity 부족을 InternalError 로 던짐)
-              elif echo "$ERR" | grep -qi "TooManyRequests"; then
+              if echo "$ERR" | grep -qi "TooManyRequests"; then
                 echo "  → 429 throttle, 90초 백오프"
                 sleep 90
-              else
-                # capacity/429 가 아닌 진짜 설정 에러 → 알림 후 중단(물량 나도 못 잡으니)
-                echo "  → 설정성 에러로 판단"
-                CONFIG_ERR=1
-                notify "❌ a1-hunter 설정 에러 의심: $(echo "$ERR" | tr '\n' ' ' | head -c 200)"
-                break
               fi
             done
-            [ "$CONFIG_ERR" = "1" ] && exit 1
             sleep 60
           done
-          echo "이번 회차(${ATTEMPT}회) 미생성 — capacity 대기 중(Internal='Out of host capacity')"
+          echo "이번 회차(${ATTEMPT}회) 미생성 — capacity 대기 중(다음 실행에서 계속)"
