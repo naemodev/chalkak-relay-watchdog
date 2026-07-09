@@ -52,6 +52,7 @@ jobs:
 
           ADS=$(oci iam availability-domain list --query 'data[].name' --raw-output | tr -d '[]"," ')
           echo "ADS=$ADS"
+          echo "SUBNET=[$SUBNET]"
           echo "${{ secrets.A1_SSH_PUBKEY }}" > /tmp/a1.pub
 
           DEADLINE=$(( $(date +%s) + 18*60 ))
@@ -71,7 +72,7 @@ jobs:
                 exit 0
               fi
               # 실패는 종류 불문 로그에만 (capacity / 연결오류 / 429 등) — 알림 안 함
-              ERR=$(head -c 600 /tmp/launch.err)
+              ERR=$(cat /tmp/launch.err)
               echo "[$ATTEMPT][$AD] 실패: $ERR"
               if echo "$ERR" | grep -qi "TooManyRequests"; then
                 echo "  → 429 throttle, 90초 백오프"
